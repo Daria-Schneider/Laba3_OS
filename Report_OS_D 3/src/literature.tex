@@ -1,0 +1,724 @@
+\section{Исходная программа}
+
+\begin{lstlisting}[language=C]
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "crossplatform.h"
+#include "stringutils.h"
+
+#define BUFFER_SIZE 1024
+
+typedef struct {
+    char filename[BUFFER_SIZE];
+    char command[BUFFER_SIZE];
+    char response[BUFFER_SIZE];
+    int has_filename;
+    int has_command;
+    int has_response;
+    int shutdown;
+} shared_data_t;
+
+int main(void) {
+    process_t child;
+    mmap_file_t mmap;
+    char line[BUFFER_SIZE];
+    
+    memset(&child, 0, sizeof(child));
+    memset(&mmap, 0, sizeof(mmap));
+
+    printf("Lab 3 - Parent process started\n");
+
+    if (CpMmapCreate(&mmap, SHARED_MEM_NAME, sizeof(shared_data_t)) != 0) {
+        fprintf(stderr, "Error: failed to create shared memory\n");
+        return EXIT_FAILURE;
+    }
+
+    shared_data_t* shared = (shared_data_t*)mmap.data;
+    memset(shared, 0, sizeof(shared_data_t));
+
+    const char *childPath = CpGetChildProcessName("child");
+
+    printf("Creating child process...\n");
+    if (CpProcessCreate(&child, childPath) != 0) {
+        fprintf(stderr, "Error: failed to create child process\n");
+        CpMmapClose(&mmap);
+        return EXIT_FAILURE;
+    }
+
+    printf("Enter file name: ");
+    if (!fgets(line, sizeof(line), stdin)) {
+        fprintf(stderr, "Error: failed to read file name\n");
+        shared->shutdown = 1;
+        CpMmapSync(&mmap);
+        CpProcessClose(&child);
+        CpMmapClose(&mmap);
+        return EXIT_FAILURE;
+    }
+    TrimNewline(line);
+
+    strncpy(shared->filename, line, sizeof(shared->filename) - 1);
+    shared->filename[sizeof(shared->filename) - 1] = '\0';
+    shared->has_filename = 1;
+    CpMmapSync(&mmap);
+
+    int timeout = 0;
+    while (!shared->has_response && !shared->shutdown && timeout < 200) {
+#ifdef _WIN32
+        Sleep(10);
+#else
+        usleep(10000);
+#endif
+        timeout++;
+    }
+
+    if (shared->shutdown) {
+        printf("Child process failed to open file\n");
+        CpProcessClose(&child);
+        CpMmapClose(&mmap);
+        return EXIT_FAILURE;
+    }
+
+    if (shared->has_response) {
+        printf("%s\n", shared->response);
+        shared->has_response = 0;
+        CpMmapSync(&mmap);
+        
+        if (CpStringContains(shared->response, "Error:")) {
+            CpProcessClose(&child);
+            CpMmapClose(&mmap);
+            return EXIT_FAILURE;
+        }
+    }
+
+    printf("Ready. Enter strings (empty to exit):\n");
+
+    while (1) {
+        printf("> ");
+        if (!fgets(line, sizeof(line), stdin)) break;
+        TrimNewline(line);
+
+        if (strlen(line) == 0) {
+            shared->shutdown = 1;
+            CpMmapSync(&mmap);
+            break;
+        }
+
+        strncpy(shared->command, line, sizeof(shared->command) - 1);
+        shared->command[sizeof(shared->command) - 1] = '\0';
+        shared->has_command = 1;
+        shared->has_response = 0;
+        CpMmapSync(&mmap);
+
+        timeout = 0;
+        while (!shared->has_response && !shared->shutdown && timeout < 100) {
+#ifdef _WIN32
+            Sleep(10);
+#else
+            usleep(10000);
+#endif
+            timeout++;
+        }
+
+        if (shared->shutdown) break;
+
+        if (shared->has_response) {
+            printf("Result: %s\n", shared->response);
+            shared->has_response = 0;
+            CpMmapSync(&mmap);
+        }
+    }
+
+    CpProcessClose(&child);
+    CpMmapClose(&mmap);
+    
+#ifndef _WIN32
+    shm_unlink(SHARED_MEM_NAME);
+#endif
+    
+    printf("Parent process finished\n");
+    return EXIT_SUCCESS;
+}
+\end{lstlisting}
+Листинг 1: parent.c - Родительский процесс, создающий разделяемую память и управляющий взаимодействием с дочерним процессом
+
+\begin{lstlisting}[language=C]
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "crossplatform.h"
+#include "stringutils.h"
+
+#define BUFFER_SIZE 1024
+
+typedef struct {
+    char filename[BUFFER_SIZE];
+    char command[BUFFER_SIZE];
+    char response[BUFFER_SIZE];
+    int has_filename;
+    int has_command;
+    int has_response;
+    int shutdown;
+} shared_data_t;
+
+int main(void) {
+    mmap_file_t mmap;
+    FILE* file = NULL;
+    int file_opened = 0;
+
+    printf("Child process started\n");
+
+    if (CpMmapOpen(&mmap, SHARED_MEM_NAME, sizeof(shared_data_t)) != 0) {
+        printf("Error: failed to open shared memory\n");
+        return EXIT_FAILURE;
+    }
+
+    shared_data_t* shared = (shared_data_t*)mmap.data;
+
+    while (!shared->shutdown) {
+        if (!file_opened && shared->has_filename) {
+            char* filename = shared->filename;
+            shared->has_filename = 0;
+            CpMmapSync(&mmap);
+
+            file = fopen(filename, "w");
+            if (file == NULL) {
+                snprintf(shared->response, sizeof(shared->response), 
+                         "Error: cannot open file '%s' for writing", filename);
+                shared->has_response = 1;
+                shared->shutdown = 1;
+                CpMmapSync(&mmap);
+                break;
+            }
+
+            snprintf(shared->response, sizeof(shared->response), 
+                     "File '%s' opened successfully", filename);
+            shared->has_response = 1;
+            file_opened = 1;
+            CpMmapSync(&mmap);
+            continue;
+        }
+
+        if (file_opened && shared->has_command) {
+            char* command = shared->command;
+            shared->has_command = 0;
+            CpMmapSync(&mmap);
+
+            if (strlen(command) == 0) {
+                shared->shutdown = 1;
+                CpMmapSync(&mmap);
+                break;
+            }
+
+            if (IsCapitalStart(command)) {
+                fprintf(file, "%s\n", command);
+                fflush(file);
+                snprintf(shared->response, sizeof(shared->response), "OK");
+            } else {
+                snprintf(shared->response, sizeof(shared->response), 
+                         "ERROR: must start with capital letter");
+            }
+            
+            shared->has_response = 1;
+            CpMmapSync(&mmap);
+        }
+        
+#ifdef _WIN32
+        Sleep(10);
+#else
+        usleep(10000);
+#endif
+    }
+
+    if (file) fclose(file);
+    CpMmapClose(&mmap);
+    
+    printf("Child process finished\n");
+    return EXIT_SUCCESS;
+}
+\end{lstlisting}
+Листинг 2: child.c - Дочерний процесс, работающий с разделяемой памятью и проверяющий строки на соответствие правилу
+
+\begin{lstlisting}[language=C]
+#include "crossplatform.h"
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+
+#ifdef _WIN32
+
+int CpMmapCreate(mmap_file_t* mmap, const char* name, size_t size) {
+    if (!mmap || !name) return -1;
+    
+    mmap->hFile = CreateFileMappingA(
+        INVALID_HANDLE_VALUE,
+        NULL,
+        PAGE_READWRITE,
+        0,
+        (DWORD)size,
+        name
+    );
+    
+    if (mmap->hFile == NULL) return -1;
+    
+    mmap->data = MapViewOfFile(mmap->hFile, FILE_MAP_ALL_ACCESS, 0, 0, size);
+    if (mmap->data == NULL) {
+        CloseHandle(mmap->hFile);
+        return -1;
+    }
+    
+    mmap->size = size;
+    memset(mmap->data, 0, size);
+    return 0;
+}
+
+int CpMmapOpen(mmap_file_t* mmap, const char* name, size_t size) {
+    if (!mmap || !name) return -1;
+    
+    mmap->hFile = OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, name);
+    if (mmap->hFile == NULL) return -1;
+    
+    mmap->data = MapViewOfFile(mmap->hFile, FILE_MAP_ALL_ACCESS, 0, 0, size);
+    if (mmap->data == NULL) {
+        CloseHandle(mmap->hFile);
+        return -1;
+    }
+    
+    mmap->size = size;
+    return 0;
+}
+
+void CpMmapClose(mmap_file_t* mmap) {
+    if (!mmap) return;
+    
+    if (mmap->data) {
+        UnmapViewOfFile(mmap->data);
+        mmap->data = NULL;
+    }
+    
+    if (mmap->hFile) {
+        CloseHandle(mmap->hFile);
+        mmap->hFile = NULL;
+    }
+}
+
+void CpMmapSync(mmap_file_t* mmap) {
+    if (mmap && mmap->data) {
+        FlushViewOfFile(mmap->data, mmap->size);
+    }
+}
+
+#else
+
+int CpMmapCreate(mmap_file_t* mmap, const char* name, size_t size) {
+    if (!mmap || !name) return -1;
+    
+    mmap->fd = shm_open(name, O_CREAT | O_RDWR, 0666);
+    if (mmap->fd == -1) return -1;
+    
+    if (ftruncate(mmap->fd, size) == -1) {
+        close(mmap->fd);
+        return -1;
+    }
+    
+    mmap->data = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, mmap->fd, 0);
+    if (mmap->data == MAP_FAILED) {
+        close(mmap->fd);
+        return -1;
+    }
+    
+    mmap->size = size;
+    memset(mmap->data, 0, size);
+    return 0;
+}
+
+int CpMmapOpen(mmap_file_t* mmap, const char* name, size_t size) {
+    if (!mmap || !name) return -1;
+    
+    mmap->fd = shm_open(name, O_RDWR, 0666);
+    if (mmap->fd == -1) return -1;
+    
+    mmap->data = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, mmap->fd, 0);
+    if (mmap->data == MAP_FAILED) {
+        close(mmap->fd);
+        return -1;
+    }
+    
+    mmap->size = size;
+    return 0;
+}
+
+void CpMmapClose(mmap_file_t* mmap) {
+    if (!mmap) return;
+    
+    if (mmap->data && mmap->data != MAP_FAILED) {
+        munmap(mmap->data, mmap->size);
+        mmap->data = NULL;
+    }
+    
+    if (mmap->fd != -1) {
+        close(mmap->fd);
+        mmap->fd = -1;
+    }
+}
+
+void CpMmapSync(mmap_file_t* mmap) {
+    if (mmap && mmap->data && mmap->data != MAP_FAILED) {
+        msync(mmap->data, mmap->size, MS_SYNC);
+    }
+}
+
+#endif
+
+#ifdef _WIN32
+
+int CpProcessCreate(process_t* proc, const char* path) {
+    if (!proc || !path) return -1;
+
+    SECURITY_ATTRIBUTES sa;
+    sa.nLength = sizeof(SECURITY_ATTRIBUTES);
+    sa.bInheritHandle = TRUE;
+    sa.lpSecurityDescriptor = NULL;
+
+    HANDLE childStdoutRead = NULL;
+    HANDLE childStdoutWrite = NULL;
+    HANDLE childStdinRead = NULL;
+    HANDLE childStdinWrite = NULL;
+
+    if (!CreatePipe(&childStdoutRead, &childStdoutWrite, &sa, 0)) return -1;
+    if (!CreatePipe(&childStdinRead, &childStdinWrite, &sa, 0)) {
+        CloseHandle(childStdoutRead);
+        CloseHandle(childStdoutWrite);
+        return -1;
+    }
+
+    SetHandleInformation(childStdoutRead, HANDLE_FLAG_INHERIT, 0);
+    SetHandleInformation(childStdinWrite, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.hStdError = childStdoutWrite;
+    si.hStdOutput = childStdoutWrite;
+    si.hStdInput = childStdinRead;
+    si.dwFlags |= STARTF_USESTDHANDLES;
+
+    char cmdline[1024];
+    strncpy(cmdline, path, sizeof(cmdline)-1);
+    cmdline[sizeof(cmdline)-1] = '\0';
+
+    if (!CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
+        CloseHandle(childStdoutRead);
+        CloseHandle(childStdoutWrite);
+        CloseHandle(childStdinRead);
+        CloseHandle(childStdinWrite);
+        return -1;
+    }
+
+    CloseHandle(childStdoutWrite);
+    CloseHandle(childStdinRead);
+
+    proc->handle = pi.hProcess;
+    proc->hStdInput = childStdinWrite;
+    proc->hStdOutput = childStdoutRead;
+
+    CloseHandle(pi.hThread);
+    return 0;
+}
+
+int CpProcessWrite(process_t* proc, const char* data, size_t size) {
+    if (!proc || !data) return -1;
+    DWORD written = 0;
+    if (!WriteFile(proc->hStdInput, data, (DWORD)size, &written, NULL)) {
+        return -1;
+    }
+    return (int)written;
+}
+
+int CpProcessRead(process_t* proc, char* buffer, size_t size) {
+    if (!proc || !buffer || size == 0) return -1;
+    DWORD readBytes = 0;
+    if (!ReadFile(proc->hStdOutput, buffer, (DWORD)(size - 1), &readBytes, NULL)) {
+        return -1;
+    }
+    buffer[readBytes] = '\0';
+    return (int)readBytes;
+}
+
+int CpProcessClose(process_t* proc) {
+    if (!proc) return -1;
+    int exitCode = -1;
+    if (proc->hStdInput) {
+        CloseHandle(proc->hStdInput);
+        proc->hStdInput = NULL;
+    }
+    if (proc->hStdOutput) {
+        CloseHandle(proc->hStdOutput);
+        proc->hStdOutput = NULL;
+    }
+    if (proc->handle) {
+        WaitForSingleObject(proc->handle, INFINITE);
+        DWORD code;
+        if (GetExitCodeProcess(proc->handle, &code)) {
+            exitCode = (int)code;
+        }
+        CloseHandle(proc->handle);
+        proc->handle = NULL;
+    }
+    return exitCode;
+}
+
+#else
+
+int CpProcessCreate(process_t* proc, const char* path) {
+    if (!proc || !path) return -1;
+    int inpipe[2];
+    int outpipe[2];
+
+    if (pipe(inpipe) == -1) return -1;
+    if (pipe(outpipe) == -1) {
+        close(inpipe[0]); close(inpipe[1]);
+        return -1;
+    }
+
+    pid_t pid = fork();
+    if (pid == -1) {
+        close(inpipe[0]); close(inpipe[1]);
+        close(outpipe[0]); close(outpipe[1]);
+        return -1;
+    }
+
+    if (pid == 0) {
+        dup2(inpipe[0], STDIN_FILENO);
+        dup2(outpipe[1], STDOUT_FILENO);
+
+        close(inpipe[0]); close(inpipe[1]);
+        close(outpipe[0]); close(outpipe[1]);
+
+        execl(path, "child", NULL);
+        _exit(127);
+    } else {
+        close(inpipe[0]);
+        close(outpipe[1]);
+        proc->pid = pid;
+        proc->stdin_fd = inpipe[1];
+        proc->stdout_fd = outpipe[0];
+        return 0;
+    }
+}
+
+int CpProcessWrite(process_t* proc, const char* data, size_t size) {
+    if (!proc || !data) return -1;
+    ssize_t n = write(proc->stdin_fd, data, size);
+    if (n == -1) return -1;
+    return (int)n;
+}
+
+int CpProcessRead(process_t* proc, char* buffer, size_t size) {
+    if (!proc || !buffer || size == 0) return -1;
+    ssize_t n = read(proc->stdout_fd, buffer, (ssize_t)(size - 1));
+    if (n == -1) return -1;
+    if (n == 0) {
+        buffer[0] = '\0';
+        return 0;
+    }
+    buffer[n] = '\0';
+    return (int)n;
+}
+
+int CpProcessClose(process_t* proc) {
+    if (!proc) return -1;
+    int status = -1;
+    if (proc->stdin_fd != -1) {
+        close(proc->stdin_fd);
+        proc->stdin_fd = -1;
+    }
+    if (proc->stdout_fd != -1) {
+        close(proc->stdout_fd);
+        proc->stdout_fd = -1;
+    }
+    if (proc->pid > 0) {
+        waitpid(proc->pid, &status, 0);
+        if (WIFEXITED(status)) return WEXITSTATUS(status);
+    }
+    return -1;
+}
+
+#endif
+\end{lstlisting}
+Листинг 3: crossplatform.c - Реализация функций для работы с memory-mapped files в Windows и Linux
+
+\begin{lstlisting}[language=C]
+#ifndef CROSS_PLATFORM_H
+#define CROSS_PLATFORM_H
+
+#include <stddef.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#endif
+
+typedef struct {
+    void* data;
+    size_t size;
+#ifdef _WIN32
+    HANDLE hFile;
+    HANDLE hMap;
+#else
+    int fd;
+#endif
+} mmap_file_t;
+
+#ifdef _WIN32
+typedef struct {
+    HANDLE handle;
+    HANDLE hStdInput;
+    HANDLE hStdOutput;
+} process_t;
+#else
+typedef struct {
+    pid_t pid;
+    int stdin_fd;
+    int stdout_fd;
+} process_t;
+#endif
+
+int  CpMmapCreate(mmap_file_t* mmap, const char* name, size_t size);
+int  CpMmapOpen(mmap_file_t* mmap, const char* name, size_t size);
+void CpMmapClose(mmap_file_t* mmap);
+void CpMmapSync(mmap_file_t* mmap);
+
+int  CpProcessCreate(process_t* proc, const char* path);
+int  CpProcessWrite(process_t* proc, const char* data, size_t size);
+int  CpProcessRead(process_t* proc, char* buffer, size_t size);
+int  CpProcessClose(process_t* proc);
+
+size_t CpStringLength(const char* str);
+int    CpStringContains(const char* str, const char* substr);
+
+static inline const char* CpGetChildProcessName(const char* baseName) {
+    (void)baseName;
+#ifdef _WIN32
+    return "child.exe";
+#else
+    return "./child";
+#endif
+}
+
+#define SHARED_MEM_NAME "lab3_shared_memory"
+#define SHARED_MEM_SIZE 4096
+
+#endif
+\end{lstlisting}
+Листинг 4: crossplatform.h - Заголовочный файл с объявлениями для работы с memory-mapped files и процессами
+
+\begin{lstlisting}[language=C]
+#ifndef STRING_UTILS_H
+#define STRING_UTILS_H
+
+#include <stddef.h>
+
+void TrimNewline(char* str);
+int  IsCapitalStart(const char* str);
+size_t CpStringLength(const char* str);
+int    CpStringContains(const char* str, const char* substr);
+
+#endif
+\end{lstlisting}
+Листинг 5: stringutils.h - Заголовочный файл с функциями для работы со строками
+
+\begin{lstlisting}[language=C]
+#include "stringutils.h"
+#include <string.h>
+#include <ctype.h>
+
+void TrimNewline(char* str) {
+    if (!str) return;
+    size_t len = strlen(str);
+    if (len > 0 && str[len - 1] == '\n') str[len - 1] = '\0';
+}
+
+int IsCapitalStart(const char* str) {
+    if (!str || *str == '\0') return 0;
+    return isupper((unsigned char)str[0]) != 0;
+}
+
+size_t CpStringLength(const char* str) {
+    return strlen(str);
+}
+
+int CpStringContains(const char* str, const char* substr) {
+    if (!str || !substr) return 0;
+    return strstr(str, substr) != NULL;
+}
+\end{lstlisting}
+Листинг 6: stringutils.c - Реализация функций для обработки строк и проверки условий
+
+\begin{lstlisting}[language=cmake]
+cmake_minimum_required(VERSION 3.10)
+project(Laba3_OS VERSION 1.0)
+
+set(CMAKE_C_STANDARD 99)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+
+include_directories(include)
+
+add_library(crossplatform STATIC 
+    src/crossplatform.c 
+    src/stringutils.c
+)
+
+add_executable(parent src/parent.c)
+add_executable(child src/child.c)
+
+target_link_libraries(parent crossplatform)
+target_link_libraries(child crossplatform)
+
+if(WIN32)
+    target_link_libraries(parent kernel32)
+    target_link_libraries(child kernel32)
+endif()
+
+set_target_properties(parent child crossplatform
+    PROPERTIES
+    ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
+)
+\end{lstlisting}
+Листинг 7: CMakeLists.txt - Файл конфигурации для сборки проекта
+
+\section{Системные вызовы}
+
+\begin{verbatim}
+2:19:25,1150425	parent.exe	13716	CreateFile	C:\Windows\Prefetch\PARENT.EXE-9039C707.pf	SUCCESS	Desired Access: Generic Read, Disposition: Open, Options: Synchronous IO Non-Alert, Attributes: n/a, ShareMode: None, AllocationSize: n/a, OpenResult: Opened
+2:19:25,1184790	parent.exe	13716	CreateFile	C:\Users\Daria\Desktop\Laba3_OS\build	SUCCESS	Desired Access: Execute/Traverse, Synchronize, Disposition: Open, Options: Directory, Synchronous IO Non-Alert, Attributes: n/a, ShareMode: Read, Write, AllocationSize: n/a, OpenResult: Opened
+2:19:25,1232214	parent.exe	13716	CreateFile	C:\Users\Daria\Desktop\Laba3_OS\build\child.exe	SUCCESS	Desired Access: Read Attributes, Disposition: Open, Options: Open Reparse Point, Attributes: n/a, ShareMode: Read, Write, Delete, AllocationSize: n/a, OpenResult: Opened
+2:19:25,1233374	parent.exe	13716	CreateFile	C:\Users\Daria\Desktop\Laba3_OS\build\child.exe	SUCCESS	Desired Access: Read Attributes, Disposition: Open, Options: Open Reparse Point, Attributes: n/a, ShareMode: Read, Write, Delete, AllocationSize: n/a, OpenResult: Opened
+2:19:25,1242543	parent.exe	13716	CreateFile	C:\Users\Daria\Desktop\Laba3_OS\build\child.exe	SUCCESS	Desired Access: Read Data/List Directory, Execute/Traverse, Read Attributes, Synchronize, Disposition: Open, Options: Synchronous IO Non-Alert, Non-Directory File, Attributes: N, ShareMode: Read, Delete, AllocationSize: n/a, OpenResult: Opened
+2:19:25,1596776	parent.exe	13716	CreateFileMapping	C:\Users\Daria\Desktop\Laba3_OS\build\child.exe	FILE LOCKED WITH ONLY READERS	SyncType: SyncTypeCreateSection, PageProtection: PAGE_EXECUTE|PAGE_NOCACHE
+2:19:25,1597987	parent.exe	13716	CreateFileMapping	C:\Users\Daria\Desktop\Laba3_OS\build\child.exe	SUCCESS	SyncType: SyncTypeOther
+2:19:25,1624932	parent.exe	13716	CreateFile	C:\Windows\apppatch\sysmain.sdb	SUCCESS	Desired Access: Generic Read, Disposition: Open, Options: Synchronous IO Non-Alert, Non-Directory File, Attributes: N, ShareMode: Read, AllocationSize: n/a, OpenResult: Opened
+2:19:25,1626884	parent.exe	13716	CreateFile	C:\Windows\apppatch\sysmain.sdb	SUCCESS	Desired Access: Generic Read, Disposition: Open, Options: Synchronous IO Non-Alert, Non-Directory File, Attributes: N, ShareMode: Read, Delete, AllocationSize: n/a, OpenResult: Opened
+2:19:25,1627146	parent.exe	13716	CreateFileMapping	C:\Windows\apppatch\sysmain.sdb	FILE LOCKED WITH ONLY READERS	SyncType: SyncTypeCreateSection, PageProtection: PAGE_EXECUTE
+2:19:25,1627316	parent.exe	13716	CreateFileMapping	C:\Windows\apppatch\sysmain.sdb	SUCCESS	SyncType: SyncTypeOther
+2:19:25,1628649	parent.exe	13716	CreateFileMapping	C:\Users\Daria\Desktop\Laba3_OS\build\child.exe	FILE LOCKED WITH ONLY READERS	SyncType: SyncTypeCreateSection, PageProtection: PAGE_EXECUTE
+2:19:25,1628788	parent.exe	13716	CreateFileMapping	C:\Users\Daria\Desktop\Laba3_OS\build\child.exe	SUCCESS	SyncType: SyncTypeOther
+2:19:25,1636738	parent.exe	13716	CreateFile	C:\Windows\apppatch\sysmain.sdb	SUCCESS	Desired Access: Generic Read, Disposition: Open, Options: Synchronous IO Non-Alert, Non-Directory File, Attributes: N, ShareMode: Read, AllocationSize: n/a, OpenResult: Opened
+2:19:25,1640225	child.exe	12272	CreateFile	C:\Windows\Prefetch\CHILD.EXE-3CC5A791.pf	SUCCESS	Desired Access: Generic Read, Disposition: Open, Options: Synchronous IO Non-Alert, Attributes: n/a, ShareMode: None, AllocationSize: n/a, OpenResult: Opened
+2:19:25,1683921	child.exe	12272	CreateFile	C:\Users\Daria\Desktop\Laba3_OS\build	SUCCESS	Desired Access: Execute/Traverse, Synchronize, Disposition: Open, Options: Directory, Synchronous IO Non-Alert, Attributes: n/a, ShareMode: Read, Write, AllocationSize: n/a, OpenResult: Opened
+2:19:58,7774295	child.exe	12272	CreateFile	C:\Users\Daria\Desktop\Laba3_OS\build\output.txt	SUCCESS	Desired Access: Generic Write, Read Attributes, Disposition: OverwriteIf, Options: Synchronous IO Non-Alert, Non-Directory File, Attributes: N, ShareMode: Read, Write, AllocationSize: 0, OpenResult: Created
+
+\end{verbatim}
+
+Программа демонстрирует эффективное использование memory-mapped files для организации высокопроизводительного межпроцессного взаимодействия.
