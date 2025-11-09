@@ -11,16 +11,13 @@ typedef struct {
     char filename[BUFFER_SIZE];
     char command[BUFFER_SIZE];
     char response[BUFFER_SIZE];
-    int has_filename;
-    int has_command;
-    int has_response;
+    int ready;
     int shutdown;
 } shared_data_t;
 
 int main(void) {
     mmap_file_t mmap;
     FILE* file = NULL;
-    int file_opened = 0;
 
     printf("Child process started\n");
 
@@ -31,35 +28,32 @@ int main(void) {
 
     shared_data_t* shared = (shared_data_t*)mmap.data;
 
+    while (shared->filename[0] == '\0' && !shared->shutdown) {
+        CpMmapSync(&mmap);
+    }
+
+    if (shared->shutdown) {
+        CpMmapClose(&mmap);
+        return EXIT_FAILURE;
+    }
+
+    file = fopen(shared->filename, "w");
+    if (file == NULL) {
+        printf("Error: cannot open file '%s' for writing\n", shared->filename);
+        shared->shutdown = 1;
+        CpMmapSync(&mmap);
+        CpMmapClose(&mmap);
+        return EXIT_FAILURE;
+    }
+
+    printf("File '%s' opened successfully\n", shared->filename);
+    shared->ready = 1;
+    CpMmapSync(&mmap);
+
     while (!shared->shutdown) {
-        if (!file_opened && shared->has_filename) {
-            char* filename = shared->filename;
-            shared->has_filename = 0;
-            CpMmapSync(&mmap);
-
-            file = fopen(filename, "w");
-            if (file == NULL) {
-                snprintf(shared->response, sizeof(shared->response), 
-                         "Error: cannot open file '%s' for writing", filename);
-                shared->has_response = 1;
-                shared->shutdown = 1;
-                CpMmapSync(&mmap);
-                break;
-            }
-
-            snprintf(shared->response, sizeof(shared->response), 
-                     "File '%s' opened successfully", filename);
-            shared->has_response = 1;
-            file_opened = 1;
-            CpMmapSync(&mmap);
-            continue;
-        }
-
-        if (file_opened && shared->has_command) {
+        if (shared->command[0] != '\0') {
             char* command = shared->command;
-            shared->has_command = 0;
-            CpMmapSync(&mmap);
-
+            
             if (strlen(command) == 0) {
                 shared->shutdown = 1;
                 CpMmapSync(&mmap);
@@ -75,15 +69,10 @@ int main(void) {
                          "ERROR: must start with capital letter");
             }
             
-            shared->has_response = 1;
+            shared->command[0] = '\0';
             CpMmapSync(&mmap);
         }
-        
-#ifdef _WIN32
-        Sleep(10);
-#else
-        usleep(10000);
-#endif
+        CpMmapSync(&mmap);
     }
 
     if (file) fclose(file);
