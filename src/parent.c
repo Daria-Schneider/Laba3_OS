@@ -11,9 +11,7 @@ typedef struct {
     char filename[BUFFER_SIZE];
     char command[BUFFER_SIZE];
     char response[BUFFER_SIZE];
-    int has_filename;
-    int has_command;
-    int has_response;
+    int ready;
     int shutdown;
 } shared_data_t;
 
@@ -57,17 +55,10 @@ int main(void) {
 
     strncpy(shared->filename, line, sizeof(shared->filename) - 1);
     shared->filename[sizeof(shared->filename) - 1] = '\0';
-    shared->has_filename = 1;
     CpMmapSync(&mmap);
 
-    int timeout = 0;
-    while (!shared->has_response && !shared->shutdown && timeout < 200) {
-#ifdef _WIN32
-        Sleep(10);
-#else
-        usleep(10000);
-#endif
-        timeout++;
+    while (!shared->ready && !shared->shutdown) {
+        CpMmapSync(&mmap);
     }
 
     if (shared->shutdown) {
@@ -75,18 +66,6 @@ int main(void) {
         CpProcessClose(&child);
         CpMmapClose(&mmap);
         return EXIT_FAILURE;
-    }
-
-    if (shared->has_response) {
-        printf("%s\n", shared->response);
-        shared->has_response = 0;
-        CpMmapSync(&mmap);
-        
-        if (CpStringContains(shared->response, "Error:")) {
-            CpProcessClose(&child);
-            CpMmapClose(&mmap);
-            return EXIT_FAILURE;
-        }
     }
 
     printf("Ready. Enter strings (empty to exit):\n");
@@ -104,27 +83,17 @@ int main(void) {
 
         strncpy(shared->command, line, sizeof(shared->command) - 1);
         shared->command[sizeof(shared->command) - 1] = '\0';
-        shared->has_command = 1;
-        shared->has_response = 0;
         CpMmapSync(&mmap);
 
-        timeout = 0;
-        while (!shared->has_response && !shared->shutdown && timeout < 100) {
-#ifdef _WIN32
-            Sleep(10);
-#else
-            usleep(10000);
-#endif
-            timeout++;
+        while (shared->response[0] == '\0' && !shared->shutdown) {
+            CpMmapSync(&mmap);
         }
 
         if (shared->shutdown) break;
 
-        if (shared->has_response) {
-            printf("Result: %s\n", shared->response);
-            shared->has_response = 0;
-            CpMmapSync(&mmap);
-        }
+        printf("Result: %s\n", shared->response);
+        shared->response[0] = '\0';
+        CpMmapSync(&mmap);
     }
 
     CpProcessClose(&child);
